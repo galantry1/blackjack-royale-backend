@@ -123,3 +123,68 @@ app.post("/win", (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
 });
+// === LEADERBOARD ===
+const fs = require("fs");
+const path = require("path");
+
+const HISTORY_PATH = path.join(__dirname, "history.json");
+
+function readHistory() {
+  try {
+    const raw = fs.readFileSync(HISTORY_PATH, "utf8");
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+// агрегируем по раундам: считаем победы/поражения/пуши и профит
+function computeLeaderboard(metric = "wins", limit = 20) {
+  const hist = readHistory();
+  // сгруппируем по (userId, roundId)
+  const byRound = new Map(); // key: `${userId}::${roundId}` -> { bet, win }
+  for (const x of hist) {
+    const key = `${x.userId}::${x.roundId}`;
+    const obj = byRound.get(key) || { userId: x.userId, roundId: x.roundId, bet: 0, win: 0 };
+    if (x.type === "bet") obj.bet = x.amount;
+    if (x.type === "win") obj.win = x.amount;
+    byRound.set(key, obj);
+  }
+
+  // сводим по пользователям
+  const byUser = new Map(); // userId -> stats
+  for (const { userId, bet, win } of byRound.values()) {
+    const s = byUser.get(userId) || { userId, wins: 0, losses: 0, pushes: 0, profit: 0, rounds: 0, wagered: 0 };
+    s.rounds += 1;
+    s.wagered += bet || 0;
+
+    if (!win && bet) {
+      s.losses += 1;
+      s.profit -= bet; // проигрыш = минус ставка
+    } else if (win === bet && bet > 0) {
+      s.pushes += 1; // ничья
+      // profit 0
+    } else if (win > bet) {
+      s.wins += 1;
+      s.profit += (win - bet);
+    }
+    byUser.set(userId, s);
+  }
+
+  let entries = Array.from(byUser.values());
+  if (metric === "profit") {
+    entries.sort((a, b) => b.profit - a.profit || b.wins - a.wins);
+  } else {
+    // wins по умолчанию
+    entries.sort((a, b) => b.wins - a.wins || b.profit - a.profit);
+  }
+  return entries.slice(0, limit);
+}
+
+app.get("/leaderboard", (req, res) => {
+  const metric = (req.query.metric === "profit" ? "profit" : "wins");
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "20", 10)));
+  const entries = computeLeaderboard(metric, limit);
+  res.json({ ok: true, metric, entries, updatedAt: Date.now() });
+});
