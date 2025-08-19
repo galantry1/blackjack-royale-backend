@@ -7,409 +7,299 @@ const { Server: IOServer } = require("socket.io");
 const fs = require("fs");
 const path = require("path");
 
-/* ---------- Express / HTTP ---------- */
+/* ---------- App / HTTP ---------- */
 const app = express();
-app.use(cors({ origin: "*" }));
+app.use(cors({ origin: "*"}));
 app.use(bodyParser.json());
+
+// полезно для проверок Render
+app.get("/", (_, res) => res.send("ok"));
+app.get("/health", (_, res) => res.send("ok"));
+
 const server = http.createServer(app);
+
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+
 
 /* ---------- Socket.IO ---------- */
 const io = new IOServer(server, {
   path: "/socket.io",
   cors: { origin: "*", methods: ["GET", "POST"] },
-  transports: ["websocket", "polling"],
+  transports: ["polling", "websocket"], // СНАЧАЛА polling → потом апгрейд в WS
+  pingInterval: 25000,
+  pingTimeout: 60000,
+  allowEIO3: true,
 });
 
 /* ---------- Файловая "БД" ---------- */
 const DATA_DIR = path.join(process.cwd(), "data");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 const balancesPath = path.join(DATA_DIR, "balances.json");
-const historyPath = path.join(DATA_DIR, "history.json");
-const refsPath = path.join(DATA_DIR, "refs.json");
+const historyPath  = path.join(DATA_DIR, "history.json");
+const refsPath     = path.join(DATA_DIR, "refs.json");
 
-function readJSON(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return fallback;
-  }
+const readJSON = (f, fb) => { try { return JSON.parse(fs.readFileSync(f,"utf8")); } catch { return fb; } };
+const writeJSON = (f, d) => fs.writeFileSync(f, JSON.stringify(d, null, 2));
+
+let balances = readJSON(balancesPath, {}); // userId -> { balance,wins,profit }
+let history  = readJSON(historyPath, []);  // [{ userId, roundId, type, amount, ts }]
+let refs     = readJSON(refsPath, {});     // { userId: refCode, ... }
+
+// утилиты для Blackjack
+const SUITS = ["♠","♥","♦","♣"];
+const RANKS = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"];
+const randId = () => (global.crypto?.randomUUID?.() || Math.random().toString(36).slice(2));
+const cardValue = (r) => r==="A"?11:(["K","Q","J"].includes(r)?10:parseInt(r,10));
+function handValue(cards) {
+  let t=0, a=0;
+  for (const c of cards) { t+=cardValue(c.rank); if (c.rank==="A") a++; }
+  while (t>21 && a>0) { t-=10; a--; }
+  return t;
 }
-function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+function createDeck() {
+  const d=[]; for (const s of SUITS) for (const r of RANKS) d.push({rank:r,suit:s});
+  for (let i=d.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[d[i],d[j]]=[d[j],d[i]];}
+  return d;
 }
 
-let balances = readJSON(balancesPath, {});   // userId -> { balance, wins, profit, name? }
-let history  = readJSON(historyPath,  []);   // журнал идемпотентности/операций
-let refs     = readJSON(refsPath,     {});   // { userId: refCode, usedBy: [] }
+// выплаты (как у тебя)
+const PAYOUT = {
+  win: (stake) => Math.floor(stake * 1.9),
+  push: (stake) => stake,
+};
 
-/* ---------- REST ---------- */
-app.get("/health", (_req, res) => res.send("ok"));
-
-app.post("/init", (req, res) => {
-  const { userId, start = 500, username, first_name, last_name, displayName } = req.body || {};
-  if (!userId) return res.status(400).json({ ok: false, error: "no userId" });
-
-  balances[userId] ??= { balance: start, wins: 0, profit: 0 };
-  // обновим имя/ник, если пришло
-  const name = displayName || username || [first_name, last_name].filter(Boolean).join(" ");
-  if (name) balances[userId].name = name;
-
+// баланс/история – общие функции
+function ensureUser(u) {
+  balances[u] ??= { balance: 500, wins: 0, profit: 0 };
+}
+function commit() {
   writeJSON(balancesPath, balances);
-  res.json({ ok: true, balance: balances[userId].balance });
-});
+  writeJSON(historyPath, history.slice(0, 1000));
+}
 
-app.post("/balance", (req, res) => {
+// REST
+app.post("/init", (req,res) => {
+  const { userId, start=500 } = req.body || {};
+  if (!userId) return res.status(400).json({ ok:false, error:"no userId" });
+  balances[userId] ??= { balance:start, wins:0, profit:0 };
+  commit();
+  res.json({ ok:true, balance: balances[userId].balance });
+});
+app.post("/balance", (req,res) => {
   const { userId } = req.body || {};
-  if (!userId) return res.status(400).json({ ok: false, error: "no userId" });
-  const b = balances[userId]?.balance ?? 0;
-  res.json({ ok: true, balance: b });
+  ensureUser(userId);
+  res.json({ ok:true, balance: balances[userId].balance });
 });
-
-app.post("/bet", (req, res) => {
+app.post("/bet", (req,res) => {
   const { userId, amount, roundId } = req.body || {};
-  if (!userId || !amount || !roundId) return res.status(400).json({ ok: false });
+  if (!userId || !amount || !roundId) return res.status(400).json({ ok:false });
+  ensureUser(userId);
 
-  balances[userId] ??= { balance: 500, wins: 0, profit: 0 };
+  const already = history.find(h => h.roundId===roundId && h.type==="bet");
+  if (already) return res.json({ ok:true, success:true, balance: balances[userId].balance });
 
-  const already = history.find(h => h.roundId === roundId && h.type === "bet");
-  if (already) return res.json({ ok: true, success: true, balance: balances[userId].balance });
-
-  if (balances[userId].balance < amount) {
-    return res.json({ ok: true, success: false, message: "no funds" });
-  }
+  if (balances[userId].balance < amount)
+    return res.json({ ok:true, success:false, message:"Недостаточно средств" });
 
   balances[userId].balance -= amount;
   balances[userId].profit  -= amount;
-  history.unshift({ userId, roundId, type: "bet", amount, ts: Date.now() });
-
-  writeJSON(balancesPath, balances);
-  writeJSON(historyPath, history.slice(0, 1000));
-
-  res.json({ ok: true, success: true, balance: balances[userId].balance });
+  history.unshift({ userId, roundId, type:"bet", amount, ts: Date.now() });
+  commit();
+  res.json({ ok:true, success:true, balance: balances[userId].balance });
 });
-
-app.post("/win", (req, res) => {
+app.post("/win", (req,res) => {
   const { userId, amount, roundId } = req.body || {};
-  if (!userId || amount == null || !roundId) return res.status(400).json({ ok: false });
+  if (!userId || amount==null || !roundId) return res.status(400).json({ ok:false });
 
-  const already = history.find(h => h.roundId === roundId && h.type === "win");
-  if (already) return res.json({ ok: true, success: true, balance: balances[userId].balance });
+  ensureUser(userId);
+  const already = history.find(h => h.roundId===roundId && h.type==="win");
+  if (already) return res.json({ ok:true, success:true, balance: balances[userId].balance });
 
-  balances[userId] ??= { balance: 500, wins: 0, profit: 0 };
   balances[userId].balance += amount;
-  if (amount > 0) balances[userId].wins += 1;
-  balances[userId].profit += amount;
+  balances[userId].profit  += amount;
+  if (amount>0) balances[userId].wins += 1;
 
-  history.unshift({ userId, roundId, type: "win", amount, ts: Date.now() });
-
-  writeJSON(balancesPath, balances);
-  writeJSON(historyPath, history.slice(0, 1000));
-
-  res.json({ ok: true, success: true, balance: balances[userId].balance });
+  history.unshift({ userId, roundId, type:"win", amount, ts: Date.now() });
+  commit();
+  res.json({ ok:true, success:true, balance: balances[userId].balance });
 });
-
-app.get("/leaderboard", (req, res) => {
-  const metric = (req.query.metric || "wins").toString();
-  const limit  = Number(req.query.limit || 20);
-
-  const entries = Object.entries(balances).map(([userId, v]) => ({
-    userId,
-    wins: v.wins || 0,
-    profit: v.profit || 0,
-    name: v.name || null,
+app.post("/topup", (req,res) => {
+  const { userId, amount } = req.body || {};
+  ensureUser(userId);
+  balances[userId].balance += Number(amount)||0;
+  commit();
+  res.json({ ok:true, balance: balances[userId].balance });
+});
+app.get("/leaderboard", (req,res) => {
+  const metric = String(req.query.metric||"wins");
+  const limit = Number(req.query.limit||20);
+  const entries = Object.entries(balances).map(([userId,v])=>({
+    userId, wins:v.wins||0, profit:v.profit||0
   }));
-
-  const sorted = entries
-    .sort((a, b) => (metric === "profit" ? b.profit - a.profit : b.wins - a.wins))
-    .slice(0, limit);
-
+  const sorted = entries.sort((a,b)=> metric==="profit" ? b.profit-a.profit : b.wins-a.wins).slice(0,limit);
   res.json({ entries: sorted });
 });
 
-app.post("/topup", (req, res) => {
-  const { userId, amount } = req.body || {};
-  if (!userId || !amount) return res.status(400).json({ ok: false });
-  balances[userId] ??= { balance: 500, wins: 0, profit: 0 };
-  balances[userId].balance += amount;
-  writeJSON(balancesPath, balances);
-  res.json({ ok: true, balance: balances[userId].balance });
-});
+/* ---------- Matchmaking / PvP Rooms ---------- */
+const queues = new Map(); // stake -> [socket.id,...]
+const rooms  = new Map(); // roomId -> state
 
-/* ---- простые рефы, чтобы фронт не падал ---- */
-app.post("/reflink", (req, res) => {
-  const { userId } = req.body || {};
-  if (!userId) return res.status(400).json({ ok: false });
-  refs[userId] ??= { code: userId.slice(-6), usedBy: [] };
-  writeJSON(refsPath, refs);
-  const code = refs[userId].code;
-  res.json({
-    web: `https://example.com/?ref=${code}`,
-    telegram: `https://t.me/your_bot?start=${code}`,
-  });
-});
-app.post("/apply-ref", (req, res) => {
-  const { userId, code } = req.body || {};
-  if (!userId || !code) return res.status(400).json({ ok: false });
-  const ownerId = Object.keys(refs).find(uid => refs[uid].code === code);
-  if (ownerId && ownerId !== userId) {
-    refs[ownerId].usedBy ||= [];
-    if (!refs[ownerId].usedBy.includes(userId)) refs[ownerId].usedBy.push(userId);
-    writeJSON(refsPath, refs);
-  }
-  res.json({ success: true });
-});
-
-/* ---------- PVP Игра 1-на-1 (серверная механика) ---------- */
-const queues = new Map(); // stake -> [{ socketId, userId, name, roundId }]
-const rooms  = new Map(); // roomId -> { stake, players:[{socketId,userId,name,roundId,hand,stood,moved}], deck, deadline, timer }
-
-function createDeck() {
-  const suits  = ["♠","♥","♦","♣"];
-  const ranks  = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"];
-  const deck = [];
-  for (const s of suits) for (const r of ranks) deck.push({ suit: s, rank: r });
-  return deck;
-}
-function shuffle(a) {
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-}
-function cardPoints(rank) {
-  if (rank === "A") return 11;
-  if (["K","Q","J"].includes(rank)) return 10;
-  return parseInt(rank, 10);
-}
-function handPoints(hand) {
-  let total = 0, aces = 0;
-  for (const c of hand) {
-    total += cardPoints(c.rank);
-    if (c.rank === "A") aces++;
-  }
-  while (total > 21 && aces > 0) { total -= 10; aces--; }
-  return total;
-}
-
-function publicState(room) {
-  return {
-    stake: room.stake,
-    deadline: room.deadline,
-    players: room.players.map(p => ({
-      userId: p.userId,
-      name: p.name || null,
-      hand: p.hand,
-      stood: p.stood,
-      points: handPoints(p.hand),
-    })),
-  };
-}
-
-function startGame(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-
-  const deck = createDeck();
-  shuffle(deck);
-
-  // сдача по 2 карты
-  for (const p of room.players) {
-    p.hand = [deck.pop(), deck.pop()];
-    p.stood = false;
-    p.moved = false; // для авто-проигрыша, если ни разу не походил
-  }
-
-  room.deck = deck;
-  room.deadline = Date.now() + 30_000;
-
-  // тикаем раз в 1 сек, на дедлайне — автодействия
-  room.timer && clearInterval(room.timer);
-  room.timer = setInterval(() => tickRoom(roomId), 1000);
-
-  io.to(roomId).emit("start", { roomId, state: publicState(room) });
-  io.to(roomId).emit("state", { roomId, state: publicState(room) });
-}
-
-function tickRoom(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  if (Date.now() < room.deadline) return;
-
-  // дедлайн — автопереход к завершению
-  for (const p of room.players) {
-    if (!p.stood && !p.moved) {
-      // не сделал ни одного действия — автопроигрыш
-      p.forfeit = true;
-      p.stood = true;
-    } else if (!p.stood) {
-      // делал действия, но не нажал "стоп" — авто-стоп
-      p.stood = true;
-    }
-  }
-  finishGame(roomId);
-}
-
-function handleMove(roomId, sock, action) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  if (Date.now() > room.deadline) return; // уже истёк дедлайн
-
-  const p = room.players.find(pp => pp.socketId === sock.id);
-  if (!p || p.stood) return;
-
-  p.moved = true;
-
-  if (action === "hit") {
-    const card = room.deck.pop();
-    if (!card) {
-      p.stood = true;
-    } else {
-      p.hand.push(card);
-      if (handPoints(p.hand) > 21) {
-        p.stood = true; // перебор = автопасс
-      }
-    }
-  } else if (action === "stand") {
-    p.stood = true;
-  }
-
-  io.to(roomId).emit("state", { roomId, state: publicState(room) });
-
-  // оба стоят — закончить
-  if (room.players.every(pp => pp.stood)) {
-    finishGame(roomId);
-  }
-}
-
-function finishGame(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-
-  room.timer && clearInterval(room.timer);
-
-  const [p1, p2] = room.players;
-  const pts1 = handPoints(p1.hand);
-  const pts2 = handPoints(p2.hand);
-
-  // логика результата
-  let r1 = "push", r2 = "push";
-
-  const bust1 = pts1 > 21;
-  const bust2 = pts2 > 21;
-
-  if (p1.forfeit && !p2.forfeit) { r1 = "lose"; r2 = "win"; }
-  else if (!p1.forfeit && p2.forfeit) { r1 = "win"; r2 = "lose"; }
-  else if (bust1 && !bust2) { r1 = "lose"; r2 = "win"; }
-  else if (!bust1 && bust2) { r1 = "win"; r2 = "lose"; }
-  else if (!bust1 && !bust2) {
-    if (pts1 > pts2) { r1 = "win"; r2 = "lose"; }
-    else if (pts1 < pts2) { r1 = "lose"; r2 = "win"; }
-    else { r1 = "push"; r2 = "push"; }
-  } else {
-    // оба перебрали
-    r1 = "push"; r2 = "push";
-  }
-
-  io.to(roomId).emit("game-over", {
-    roomId,
-    stake: room.stake,
-    results: [
-      { userId: p1.userId, result: r1, points: pts1, forfeit: !!p1.forfeit },
-      { userId: p2.userId, result: r2, points: pts2, forfeit: !!p2.forfeit },
-    ],
-    state: publicState(room),
-  });
-
-  rooms.delete(roomId);
-}
-
-function leaveAllQueues(sockId) {
-  for (const q of queues.values()) {
-    const i = q.findIndex(x => x.socketId === sockId);
-    if (i !== -1) q.splice(i, 1);
-  }
-}
-function removeRoomBySocket(sockId) {
-  for (const [rid, room] of rooms.entries()) {
-    const hit = room.players.some(p => p.socketId === sockId);
-    if (hit) {
-      // диск-коннект — победа оппонента
-      const other = room.players.find(p => p.socketId !== sockId);
-      room.players.forEach(p => {
-        if (p.socketId === sockId) { p.forfeit = true; p.stood = true; }
-        else { p.stood = true; }
-      });
-      finishGame(rid);
-    }
-  }
-}
-
-function joinQueue(sock, payload) {
-  const stake = Number(payload.stake) || 10;
-  const roundId = payload.roundId || null;
-  const name = payload.name || null;
-  const userId = sock.data.userId;
-
+function joinQueue(sock, stake) {
   if (!queues.has(stake)) queues.set(stake, []);
   const q = queues.get(stake);
-  if (!q.some(x => x.socketId === sock.id)) {
-    q.push({ socketId: sock.id, userId, name, roundId });
-  }
+  if (!q.includes(sock.id)) q.push(sock.id);
 
   if (q.length >= 2) {
     const a = q.shift();
     const b = q.shift();
-    const roomId = Math.random().toString(36).slice(2, 8);
+    const roomId = Math.random().toString(36).slice(2,8);
 
-    rooms.set(roomId, {
+    const deck = createDeck();
+    const pA = [deck.pop(), deck.pop()];
+    const pB = [deck.pop(), deck.pop()];
+
+    const deadline = Date.now() + 30_000; // 30s на ходы
+
+    const state = {
+      roomId,
       stake,
-      deck: [],
-      deadline: 0,
-      timer: null,
-      players: [
-        { ...a, hand: [], stood: false, moved: false, forfeit: false },
-        { ...b, hand: [], stood: false, moved: false, forfeit: false },
-      ],
-    });
+      deck,
+      deadline,
+      players: [a,b],
+      users: {
+        [a]: { userId: io.sockets.sockets.get(a)?.data?.userId || `guest_${a}`, hand: pA, stood:false },
+        [b]: { userId: io.sockets.sockets.get(b)?.data?.userId || `guest_${b}`, hand: pB, stood:false },
+      },
+      roundId: randId(),
+    };
+    rooms.set(roomId, state);
 
-    io.to(a.socketId).emit("match-found", { roomId, stake, players: [a.userId, b.userId] });
-    io.to(b.socketId).emit("match-found", { roomId, stake, players: [a.userId, b.userId] });
-    // старт после READY от обоих (ниже)
+    io.to(a).emit("match-found", { roomId, stake, youId:a, oppId:b });
+    io.to(b).emit("match-found", { roomId, stake, youId:b, oppId:a });
   }
 }
 
-/* ---------- Socket.IO handlers ---------- */
-io.on("connection", (socket) => {
-  socket.on("hello", ({ userId, name }) => {
-    socket.data.userId = userId;
-    socket.data.name = name || null;
-  });
+function broadcastState(roomId) {
+  const r = rooms.get(roomId);
+  if (!r) return;
+  for (const sid of r.players) {
+    const you = r.users[sid];
+    const oppSid = r.players.find(x=>x!==sid);
+    const opp = r.users[oppSid];
+    io.to(sid).emit("state", {
+      roomId,
+      stake: r.stake,
+      deadline: r.deadline,
+      you: { hand: you.hand, stood: you.stood, score: handValue(you.hand) },
+      opp: { hand: opp.hand, stood: opp.stood, score: handValue(opp.hand) },
+    });
+  }
+}
 
-  socket.on("queue", (payload) => {
-    joinQueue(socket, { ...payload, name: socket.data.name });
+function trySettle(roomId, reason="") {
+  const r = rooms.get(roomId);
+  if (!r) return;
+
+  const ps = r.players.map(sid => ({
+    sid,
+    userId: r.users[sid].userId,
+    score: handValue(r.users[sid].hand),
+    stood: r.users[sid].stood
+  }));
+  const allDone = (Date.now()>r.deadline) || ps.every(p => p.stood);
+
+  if (!allDone) return;
+
+  const [A,B] = ps;
+  let resA = "push", resB = "push";
+  // перебор блокирует дальнейшие ходы
+  const aBust = A.score>21, bBust = B.score>21;
+  if (aBust && bBust) { resA="push"; resB="push"; }
+  else if (aBust && !bBust) { resA="lose"; resB="win"; }
+  else if (!aBust && bBust) { resA="win"; resB="lose"; }
+  else if (A.score > B.score) { resA="win"; resB="lose"; }
+  else if (A.score < B.score) { resA="lose"; resB="win"; }
+  else { resA="push"; resB="push"; }
+
+  // начисления прямо тут (чтобы не дергать HTTP)
+  const applyWinLocal = (userId, amount, roundId) => {
+    ensureUser(userId);
+    balances[userId].balance += amount;
+    balances[userId].profit  += amount;
+    if (amount>0) balances[userId].wins += 1;
+    history.unshift({ userId, roundId, type:"win", amount, ts: Date.now() });
+  };
+
+  const s = r.stake;
+  if (resA==="win") applyWinLocal(A.userId, PAYOUT.win(s), r.roundId);
+  if (resB==="win") applyWinLocal(B.userId, PAYOUT.win(s), r.roundId);
+  if (resA==="push") applyWinLocal(A.userId, PAYOUT.push(s), r.roundId);
+  if (resB==="push") applyWinLocal(B.userId, PAYOUT.push(s), r.roundId);
+  commit();
+
+  io.to(A.sid).emit("result", { roomId, you: A.score, opp: B.score, result: resA, reason });
+  io.to(B.sid).emit("result", { roomId, you: B.score, opp: A.score, result: resB, reason });
+
+  rooms.delete(roomId);
+}
+
+function leaveAllQueues(sid){
+  for (const q of queues.values()) {
+    const i=q.indexOf(sid); if (i!==-1) q.splice(i,1);
+  }
+}
+
+io.on("connection", (socket) => {
+  socket.on("hello", ({ userId }) => { socket.data.userId = userId; });
+
+  socket.on("queue", ({ stake }) => {
+    joinQueue(socket, Number(stake)||10);
   });
 
   socket.on("ready", ({ roomId }) => {
-    const room = rooms.get(roomId);
-    if (!room) return;
+    const r = rooms.get(roomId);
+    if (!r) return;
     socket.join(roomId);
-
-    // оба в комнате? запускаем
-    const roomSet = io.sockets.adapter.rooms.get(roomId);
-    if (roomSet && roomSet.size >= 2) startGame(roomId);
+    // старт: просто разошлем начальное состояние
+    broadcastState(roomId);
   });
 
   socket.on("move", ({ roomId, action }) => {
-    handleMove(roomId, socket, action);
+    const r = rooms.get(roomId);
+    if (!r) return;
+    const me = r.users[socket.id];
+    if (!me) return;
+
+    if (Date.now() > r.deadline) return trySettle(roomId, "timeout");
+
+    if (action === "hit" && !me.stood) {
+      const c = r.deck.pop();
+      if (c) me.hand.push(c);
+      if (handValue(me.hand) > 21) me.stood = true;
+    }
+    if (action === "stand") {
+      me.stood = true;
+    }
+
+    broadcastState(roomId);
+    trySettle(roomId);
   });
 
   socket.on("disconnect", () => {
     leaveAllQueues(socket.id);
-    removeRoomBySocket(socket.id);
+    // если ливнул из активной комнаты — авто-сдача
+    for (const [roomId, r] of rooms) {
+      if (r.players.includes(socket.id)) {
+        r.users[socket.id].stood = true;
+        r.deadline = Date.now(); // мгновенно завершим
+        trySettle(roomId, "disconnect");
+      }
+    }
   });
 });
 
-/* ---------- START ---------- */
+/* ---------- Start ---------- */
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 server.listen(PORT, () => {
   console.log("Backend+WS listening on", PORT);
