@@ -14,6 +14,10 @@ app.use(bodyParser.json());
 
 const server = http.createServer(app);
 
+/* --- Render-friendly timeouts (чтобы WS не рвались) --- */
+server.keepAliveTimeout = 61_000;   // > 60s
+server.headersTimeout   = 65_000;
+
 /* ---------------- Socket.IO ---------------- */
 const io = new IOServer(server, {
   path: "/socket.io",
@@ -43,7 +47,7 @@ let refs     = readJSON(refsPath, {          // { codes: {code: inviterId}, appl
   codes: {}, applied: {}
 });
 
-/* ---------------- Helpers ---------------- */
+/* ---------------- Helpers (Blackjack 52) ---------------- */
 const SUITS52 = ["♠", "♥", "♦", "♣"];
 const RANKS52 = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"];
 function createDeck52() {
@@ -227,18 +231,13 @@ function bjScore(hand){ return handValue(hand); }
 function bjBroadcastState(gs) {
   const [a,b] = gs.order;
   const A = gs.players[a], B = gs.players[b];
-
-  // Персональные state — каждому отправляем свой "you" с полной рукой,
-  // а "opp" — с полной рукой, НО клиент сам скрывает отображение до конца.
   function pack(p){ return { hand: p.hand, stood: p.stood, score: bjScore(p.hand) }; }
-
   io.to(a).emit("state", { roomId: gs.id, stake: gs.stake, you: pack(A), opp: pack(B), deadline: gs.deadline });
   io.to(b).emit("state", { roomId: gs.id, stake: gs.stake, you: pack(B), opp: pack(A), deadline: gs.deadline });
 }
 
 function bjFinish(gs){
   if (gs.finished) return;
-
   const [a,b] = gs.order;
   const A = gs.players[a], B = gs.players[b];
   const sa = bjScore(A.hand), sb = bjScore(B.hand);
@@ -249,9 +248,7 @@ function bjFinish(gs){
   else if (sb>21) { resA="win"; resB="lose"; }
   else if (sa>sb) { resA="win"; resB="lose"; }
   else if (sa<sb) { resA="lose"; resB="win"; }
-  else { resA="push"; resB="push"; }
 
-  // Выплаты: win -> 1.9x своей ставки; push -> возврат ставки
   const stake = gs.stake;
   const creditWin = stake + Math.floor(stake*0.9);
   const creditPush = stake;
@@ -272,11 +269,9 @@ function bjFinish(gs){
   settle(uidA, resA); settle(uidB, resB);
   writeJSON(balancesPath, balances);
 
-  // история
   history.unshift({ type:"bj_pvp_result", roomId: gs.id, stake, A:{uid:uidA,score:sa,res:resA}, B:{uid:uidB,score:sb,res:resB}, ts: Date.now() });
   writeJSON(historyPath, history.slice(0,1000));
 
-  // Сообщаем результат
   io.to(a).emit("result", { roomId: gs.id, result: resA, you: sa, opp: sb });
   io.to(b).emit("result", { roomId: gs.id, result: resB, you: sb, opp: sa });
 
@@ -292,7 +287,6 @@ io.on("connection", (socket) => {
     bjJoinQueue(socket, Number(stake) || 10);
   });
 
-  // ready: как только оба готовы — сдаём и шлём state
   socket.on("ready", ({ roomId }) => {
     const gs = bjRooms.get(roomId);
     if (!gs || gs.finished) return;
@@ -306,7 +300,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Ходы в BJ: { roomId, action: 'hit'|'stand' }
   socket.on("move", ({ roomId, action }) => {
     const gs = bjRooms.get(roomId);
     if (!gs || gs.finished) return;
@@ -315,12 +308,11 @@ io.on("connection", (socket) => {
     if (!p) return;
 
     if (Date.now() > gs.deadline) {
-      // таймаут = авто-stand для того, кто не походил
       p.stood = true;
     } else if (action === "hit" && !p.stood) {
       const card = gs.deck.pop();
       if (card) p.hand.push(card);
-      if (bjScore(p.hand) > 21) p.stood = true; // перебор = автоконец для этого игрока
+      if (bjScore(p.hand) > 21) p.stood = true;
       gs.deadline = Date.now() + 30_000;
     } else if (action === "stand") {
       p.stood = true;
@@ -329,8 +321,6 @@ io.on("connection", (socket) => {
 
     const [a,b] = gs.order;
     const A = gs.players[a], B = gs.players[b];
-
-    // если оба закончили — финал
     if (A.stood && B.stood) {
       bjFinish(gs);
     } else {
@@ -340,13 +330,11 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     bjLeaveAllQueues(socket.id);
-    // Если игрок вылетел из активной комнаты — второй победил
     for (const [rid, gs] of bjRooms) {
       if (gs.finished) continue;
       if (gs.players[socket.id]) {
         const otherSid = gs.order.find(x=>x!==socket.id);
         if (otherSid && gs.players[otherSid]) {
-          // победа второму
           const winnerId = gs.players[otherSid].userId;
           balances[winnerId] ??= { balance: 500, wins: 0, profit: 0 };
           const credit = gs.stake + Math.floor(gs.stake*0.9);
@@ -362,8 +350,7 @@ io.on("connection", (socket) => {
   });
 });
 
-/* ===================== Durak 2×2 (встроенный) ===================== */
-/* 36-картная колода, подкидной, 2 игрока — MVP. Лобби на фикс. ставки. */
+/* ===================== Durak (подкидной, 36), 2 игрока ===================== */
 (function attachDurak(io, ctx){
   const { balances, history, writeJSON } = ctx;
 
@@ -389,19 +376,28 @@ io.on("connection", (socket) => {
   }
   const now = ()=>Date.now();
   const serialize = h => h.map(c=>({rank:c.rank,suit:c.suit}));
+  const roomName = (id)=>"durak-"+id;
 
-  const LOBBIES = new Map(); // id -> { id, stake, capacity:2, players:[{userId,socketId}], game }
+  const LOBBIES = new Map(); // id -> { id, title, stake, capacity:2, players:[{userId,socketId}], game }
   const PLAYER_LOBBY = new Map(); // socketId -> lobbyId
 
-  // создаём 5 лобби на каждую популярную ставку
-  for (const stake of POP_STAKES){
-    for (let i=1;i<=5;i++){
+  function seedStake(stake, count=5){
+    const exist = Array.from(LOBBIES.values()).some(L=>L.capacity===2 && L.stake===stake);
+    if (exist) return;
+    for (let i=1;i<=count;i++){
       const id = `D2-${stake}-${i}`;
       LOBBIES.set(id, { id, title:`Лобби #${i} · ${stake}`, stake, capacity:2, players:[], game:null });
     }
   }
-
-  function roomName(lobbyId){ return "durak-"+lobbyId; }
+  function ensureStake(stake){
+    if (!Array.from(LOBBIES.values()).some(L=>L.capacity===2 && L.stake===stake)) seedStake(stake, 6);
+  }
+  function firstFreeLobbyByStake(stake){
+    ensureStake(stake);
+    const list = Array.from(LOBBIES.values()).filter(L=>L.capacity===2 && L.stake===stake).sort((a,b)=>a.players.length-b.players.length);
+    for (const L of list) if (!L.game && L.players.length < L.capacity) return L;
+    return list[0] || null;
+  }
 
   function startGame(L){
     const deck = makeDeck36();
@@ -412,9 +408,16 @@ io.on("connection", (socket) => {
     for (const p of L.players) hands[p.userId] = [];
     for (let i=0;i<6;i++) for (const p of L.players) hands[p.userId].push(deck.pop());
 
-    const order = L.players.map(p=>p.userId);
-    const attacker = order[Math.floor(Math.random()*order.length)];
-    const defender = order.find(u=>u!==attacker);
+    // min-козырь начинает (если нет козырей — случайно)
+    const ids = L.players.map(p=>p.userId);
+    const trumps = ids.map(u => hands[u].filter(c=>c.suit===trump).sort((a,b)=>RANK_ORDER[a.rank]-RANK_ORDER[b.rank]));
+    let attacker = null;
+    if (trumps[0].length && trumps[1].length){
+      attacker = (RANK_ORDER[trumps[0][0].rank] <= RANK_ORDER[trumps[1][0].rank]) ? ids[0] : ids[1];
+    } else if (trumps[0].length) attacker = ids[0];
+    else if (trumps[1].length) attacker = ids[1];
+    else attacker = ids[Math.random()<0.5?0:1];
+    const defender = ids.find(u=>u!==attacker);
 
     L.game = {
       stake: L.stake, deck, trump, trumpCard,
@@ -423,11 +426,10 @@ io.on("connection", (socket) => {
       deadline: now()+60_000, finished:false
     };
 
-    for (const p of L.players) {
-      io.to(p.socketId).emit("durak:hand", { hand: serialize(hands[p.userId]) });
-    }
+    for (const p of L.players) io.to(p.socketId).emit("durak:hand", { hand: serialize(hands[p.userId]) });
     broadcast(L);
   }
+
   function broadcast(L){
     const G = L.game; if (!G) return;
     io.to(roomName(L.id)).emit("durak:state", {
@@ -436,16 +438,14 @@ io.on("connection", (socket) => {
       deckCount: G.deck.length, discardCount: G.discardCount,
       attacker: G.attacker, defender: G.defender,
       table: G.table,
-      players: L.players.map(p=>({ userId:p.userId, handCount: G.hands[p.userId].length })),
+      players: L.players.map(p=>({ userId:p.userId, handCount: G.hands[p.userId]?.length ?? 0 })),
       deadline: G.deadline
     });
   }
   function refill(L){
     const G = L.game;
     const order = [G.attacker, G.defender];
-    for (const u of order){
-      while (G.hands[u].length<6 && G.deck.length>0) G.hands[u].push(G.deck.pop());
-    }
+    for (const u of order){ while (G.hands[u].length<6 && G.deck.length>0) G.hands[u].push(G.deck.pop()); }
   }
   function endTurn_Bito(L){
     const G = L.game;
@@ -459,12 +459,10 @@ io.on("connection", (socket) => {
     for (const pair of G.table){ G.hands[G.defender].push(pair.a); if (pair.d) G.hands[G.defender].push(pair.d); }
     G.table = [];
     refill(L);
-    // атакующий остаётся тем же
     G.deadline = now()+60_000;
   }
   function tryFinish(L){
-    const G = L.game;
-    if (!G) return false;
+    const G = L.game; if (!G) return false;
     if (G.deck.length>0) return false;
     const aEmpty = G.hands[G.attacker].length===0;
     const dEmpty = G.hands[G.defender].length===0;
@@ -472,12 +470,6 @@ io.on("connection", (socket) => {
 
     const winner = aEmpty ? G.attacker : G.defender;
     const loser  = aEmpty ? G.defender : G.attacker;
-    settle(L, winner, loser);
-    G.finished = true;
-    io.to(roomName(L.id)).emit("durak:ended", { winner, loser, stake:G.stake });
-    return true;
-  }
-  function settle(L, winner, loser){
     const add = L.stake + Math.floor(L.stake*0.9);
     balances[winner] ??= { balance:500, wins:0, profit:0 };
     balances[winner].balance += add;
@@ -486,23 +478,34 @@ io.on("connection", (socket) => {
     writeJSON(balancesPath, balances);
     history.unshift({ type:"durak_win", lobbyId:L.id, stake:L.stake, winner, loser, amount:add, ts: now() });
     writeJSON(historyPath, history.slice(0,1000));
+
+    G.finished = true;
+    io.to(roomName(L.id)).emit("durak:ended", { winner, loser, stake:G.stake });
+    return true;
   }
 
+  // ---- Handlers ----
   io.on("connection", (socket)=>{
-    socket.on("durak:list", ({players, stake})=>{
-      const s = stake || 25;
+    // список лобби (никогда не пустой для нужной ставки)
+    socket.on("durak:list", ({players, stake} = {})=>{
+      const s = Number(stake ?? 25) || 25;          // <-- ВАЖНО: привести к числу!
       if (players !== 2){
-        socket.emit("durak:lobbies", { players, stake:s, lobbies:[], disabled:true });
+        socket.emit("durak:lobbies", { players, stake: s, lobbies: [] , disabled:true });
         return;
       }
+      ensureStake(s);
       const list = Array.from(LOBBIES.values())
         .filter(L=>L.capacity===2 && L.stake===s)
         .map(L=>({ id:L.id, title:L.title, stake:L.stake, capacity:L.capacity, count:L.players.length, busy: !!L.game }));
-      socket.emit("durak:lobbies", { players, stake:s, lobbies:list, disabled:false });
+      socket.emit("durak:lobbies", { players, stake: s, lobbies:list, disabled:false });
     });
 
-    socket.on("durak:join", ({ lobbyId, userId })=>{
-      const L = LOBBIES.get(lobbyId); if (!L) return socket.emit("durak:error",{message:"Лобби не найдено"});
+    // вход: можно без lobbyId — подберём свободное по ставке
+    socket.on("durak:join", ({ lobbyId, userId, stake } = {})=>{
+      const s = Number(stake ?? 25) || 25;
+      let L = lobbyId ? LOBBIES.get(lobbyId) : null;
+      if (!L) L = firstFreeLobbyByStake(s);
+      if (!L) return socket.emit("durak:error",{message:"Нет свободных лобби, попробуйте позже"});
       if (L.game) return socket.emit("durak:error",{message:"Матч уже идёт"});
       if (L.players.find(p=>p.userId===userId)) return;
       if (L.players.length>=L.capacity) return socket.emit("durak:error",{message:"Лобби заполнено"});
@@ -518,21 +521,31 @@ io.on("connection", (socket) => {
       if (L.players.length===L.capacity){ startGame(L); }
     });
 
+    // (опционально) клиенты могут синкать руку — но сервер и так хранит её
     socket.on("durak:sync-hand", ({ lobbyId, userId, hand })=>{
       const L = LOBBIES.get(lobbyId); if (!L || !L.game) return;
       L.game.hands[userId] = hand;
     });
 
-    socket.on("durak:move", ({ lobbyId, userId, action, payload })=>{
+    socket.on("durak:move", ({ lobbyId, userId, action, payload } = {})=>{
       const L = LOBBIES.get(lobbyId); if (!L || !L.game) return;
       const G = L.game;
+      if (G.finished) return;
+
       if (now()>G.deadline){
         const loser = userId;
         const winner = L.players.find(p=>p.userId!==loser)?.userId;
-        if (winner){ settle(L, winner, loser); io.to(roomName(L.id)).emit("durak:ended", { winner, loser, stake:G.stake, reason:"timeout" }); }
+        if (winner){
+          const add = L.stake + Math.floor(L.stake*0.9);
+          balances[winner] ??= { balance:500, wins:0, profit:0 };
+          balances[winner].balance += add;
+          balances[winner].wins += 1;
+          balances[winner].profit += add;
+          writeJSON(balancesPath, balances);
+          io.to(roomName(L.id)).emit("durak:ended", { winner, loser, stake:G.stake, reason:"timeout" });
+        }
         G.finished = true; return;
       }
-      if (G.finished) return;
 
       if (action==="attack"){
         if (userId!==G.attacker) return;
@@ -568,27 +581,44 @@ io.on("connection", (socket) => {
       }
       else if (action==="take"){
         if (userId!==G.defender) return;
+        if (!G.table.some(p=>!p.d)) return;
         defenderTakes(L);
       }
       else if (action==="bito"){
         if (userId!==G.attacker) return;
         if (G.table.some(p=>!p.d)) return;
         endTurn_Bito(L);
-      }
+      } else { return; }
 
       if (!G.finished && tryFinish(L)) return;
       broadcast(L);
-      for (const p of L.players){
-        io.to(p.socketId).emit("durak:hand", { hand: serialize(G.hands[p.userId]) });
-      }
+      for (const p of L.players){ io.to(p.socketId).emit("durak:hand", { hand: serialize(G.hands[p.userId]) }); }
     });
 
-    socket.on("durak:leave", ({ lobbyId })=>{
-      const L = LOBBIES.get(lobbyId); if (!L) return;
-      socket.leave(roomName(lobbyId));
+    socket.on("durak:leave", ({ lobbyId } = {})=>{
+      const id = lobbyId || PLAYER_LOBBY.get(socket.id);
+      const L = id ? LOBBIES.get(id) : null; if (!L) return;
+      socket.leave(roomName(L.id));
+      const was = L.players.find(p=>p.socketId===socket.id);
+      const leftUser = was?.userId;
       L.players = L.players.filter(p=>p.socketId!==socket.id);
       PLAYER_LOBBY.delete(socket.id);
+
+      if (leftUser && L.game && !L.game.finished){
+        const winner = L.players[0]?.userId;
+        if (winner){
+          const add = L.stake + Math.floor(L.stake*0.9);
+          balances[winner] ??= { balance:500, wins:0, profit:0 };
+          balances[winner].balance += add;
+          balances[winner].wins += 1;
+          balances[winner].profit += add;
+          writeJSON(balancesPath, balances);
+          io.to(roomName(L.id)).emit("durak:ended", { winner, loser:leftUser, stake:L.game.stake, reason:"disconnect" });
+          L.game.finished = true;
+        }
+      }
       if (L.players.length===0) L.game = null;
+
       io.to(roomName(L.id)).emit("durak:joined", {
         lobbyId:L.id, players:L.players.map(p=>p.userId), count:L.players.length, capacity:L.capacity, stake:L.stake
       });
@@ -598,19 +628,26 @@ io.on("connection", (socket) => {
       const lobbyId = PLAYER_LOBBY.get(socket.id);
       if (!lobbyId) return;
       const L = LOBBIES.get(lobbyId); if (!L) return;
-      const p = L.players.find(pp=>pp.socketId===socket.id); if (!p) return;
-      const leftUser = p.userId;
+      const p = L.players.find(pp=>pp.socketId===socket.id);
+      const leftUser = p?.userId;
+
       L.players = L.players.filter(pp=>pp.socketId!==socket.id);
       PLAYER_LOBBY.delete(socket.id);
 
-      if (L.game && !L.game.finished){
+      if (leftUser && L.game && !L.game.finished){
         const winner = L.players[0]?.userId;
         if (winner){
-          settle(L, winner, leftUser);
+          const add = L.stake + Math.floor(L.stake*0.9);
+          balances[winner] ??= { balance:500, wins:0, profit:0 };
+          balances[winner].balance += add;
+          balances[winner].wins += 1;
+          balances[winner].profit += add;
+          writeJSON(balancesPath, balances);
           io.to(roomName(L.id)).emit("durak:ended", { winner, loser:leftUser, stake:L.game.stake, reason:"disconnect" });
           L.game.finished = true;
         }
       }
+      if (L.players.length===0) L.game = null;
     });
   });
 })(io, { balances, history, writeJSON });
